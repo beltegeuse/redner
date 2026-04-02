@@ -114,23 +114,16 @@ if 'REDNER_CUDA' in os.environ:
     build_with_cuda = os.environ['REDNER_CUDA'] == '1'
 
 dynamic_libraries = []
-# Make Embree and OptiX part of the package
+# On Linux, use system Embree/TBB/OptiX (no bundling needed).
+# OptiX 9.1 is header-only (driver-loaded), so no library to bundle.
 if sys.platform == 'darwin':
     dynamic_libraries.append('redner-dependencies/embree/lib-macos/libembree3.dylib')
     dynamic_libraries.append('redner-dependencies/embree/lib-macos/libtbb.dylib')
     dynamic_libraries.append('redner-dependencies/embree/lib-macos/libtbbmalloc.dylib')
-elif sys.platform == 'linux':
-    dynamic_libraries.append('redner-dependencies/embree/lib-linux/libembree3.so.3')
-    dynamic_libraries.append('redner-dependencies/embree/lib-linux/libtbb.so.2')
-    dynamic_libraries.append('redner-dependencies/embree/lib-linux/libtbbmalloc.so.2')
-    if build_with_cuda:
-        dynamic_libraries.append('redner-dependencies/optix/lib64/liboptix_prime.so.1')
 elif sys.platform == 'win32':
     dynamic_libraries.append('redner-dependencies/embree/bin/embree3.dll')
     dynamic_libraries.append('redner-dependencies/embree/bin/tbb.dll')
     dynamic_libraries.append('redner-dependencies/embree/bin/tbbmalloc.dll')
-    if build_with_cuda:
-        dynamic_libraries.append('redner-dependencies/optix/bin64/optix_prime.1.dll')
 
 project_name = 'redner'
 if 'PROJECT_NAME' in os.environ:

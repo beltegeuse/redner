@@ -17,13 +17,11 @@ option(REDNER_CUDA "Build redner with GPU code path?" OFF)
 if(REDNER_CUDA)
     message(STATUS "Build with CUDA support")
     find_package(CUDA 10 REQUIRED)
-    set(CMAKE_CUDA_STANDARD 11)
+    set(CMAKE_CUDA_STANDARD 17)
     if(NOT WIN32)
         # Hack: for some reason the line above doesn't work on some Linux systems.
-        set(CUDA_NVCC_FLAGS "${CUDA_NVCC_FLAGS} -std=c++11")
+        set(CUDA_NVCC_FLAGS "${CUDA_NVCC_FLAGS} -std=c++17")
     endif()
-    # We don't set REQUIRED here as the main OptiX lib will not be found
-    # (only OptiX Prime is required)
     find_package(OptiX)
 else()
     message(STATUS "Build without CUDA support")
@@ -32,14 +30,17 @@ endif()
 
 find_package(Embree REQUIRED)
 
-include_directories(${PYTHON_INCLUDE_PATH})
+include_directories(${Python_INCLUDE_DIRS})
 include_directories(${EMBREE_INCLUDE_PATH})
 include_directories(pybind11/include)
 if(REDNER_CUDA)
     include_directories(${OptiX_INCLUDE})
+    # CCCL thrust headers live under <CUDA_TOOLKIT>/include/cccl/ in newer CUDA
+    include_directories(${CUDA_TOOLKIT_INCLUDE}/cccl)
     link_directories(${CUDA_LIBRARIES})
 else()
     include_directories(${THRUST_INCLUDE_DIR})
+    include_directories(${THRUST_INCLUDE_DIR}/dependencies/libcudacxx/include)
 endif()
 
 if(NOT MSVC)
@@ -144,8 +145,41 @@ if(REDNER_CUDA)
         src/sobol_sampler.cpp
         PROPERTIES CUDA_SOURCE_PROPERTY_FORMAT OBJ)
 
+    # Compile OptiX device programs to PTX
+    set(OPTIX_PTX_SOURCE ${CMAKE_SOURCE_DIR}/src/optix_programs.cu)
+    set(OPTIX_PTX_OUTPUT ${CMAKE_BINARY_DIR}/optix_programs.ptx)
+    set(OPTIX_PTX_HEADER ${CMAKE_BINARY_DIR}/optix_programs_ptx.h)
+
+    add_custom_command(
+        OUTPUT ${OPTIX_PTX_OUTPUT}
+        COMMAND ${CUDA_NVCC_EXECUTABLE}
+            --ptx
+            -I${OptiX_INCLUDE}
+            -I${CMAKE_SOURCE_DIR}/src
+            -I${CUDA_TOOLKIT_INCLUDE}
+            --std=c++17
+            -o ${OPTIX_PTX_OUTPUT}
+            ${OPTIX_PTX_SOURCE}
+        DEPENDS ${OPTIX_PTX_SOURCE} ${CMAKE_SOURCE_DIR}/src/optix_launch_params.h
+        COMMENT "Compiling OptiX device programs to PTX"
+    )
+
+    # Embed PTX as C array using bin2c
+    add_custom_command(
+        OUTPUT ${OPTIX_PTX_HEADER}
+        COMMAND ${CUDA_TOOLKIT_ROOT_DIR}/bin/bin2c
+            -c -p 0 -n optix_programs_ptx
+            ${OPTIX_PTX_OUTPUT} > ${OPTIX_PTX_HEADER}
+        DEPENDS ${OPTIX_PTX_OUTPUT}
+        COMMENT "Embedding PTX as C header"
+    )
+
+    add_custom_target(optix_ptx ALL DEPENDS ${OPTIX_PTX_HEADER})
+
     cuda_add_library(redner MODULE ${SRCS})
-    target_link_libraries(redner ${optix_prime_LIBRARY})
+    add_dependencies(redner optix_ptx)
+    target_include_directories(redner PRIVATE ${CMAKE_BINARY_DIR})
+    target_link_libraries(redner ${CUDA_CUDA_LIBRARY})
 else()
     add_library(redner MODULE ${SRCS})
 endif()
@@ -179,7 +213,7 @@ elseif(APPLE)
     set_target_properties(redner PROPERTIES INSTALL_RPATH "@loader_path")
 endif()
 
-set_property(TARGET redner PROPERTY CXX_STANDARD 11)
+set_property(TARGET redner PROPERTY CXX_STANDARD 17)
 set_target_properties(redner PROPERTIES PREFIX "")
 # Still enable assertion in release mode
 string( REPLACE "/DNDEBUG" "" CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE}")

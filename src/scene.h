@@ -15,7 +15,9 @@
 #include <memory>
 #include <embree3/rtcore.h>
 #ifdef COMPILE_WITH_CUDA
-  #include <optix_prime/optix_primepp.h>
+  #include <optix.h>
+  #include <optix_stubs.h>
+  #include <cuda.h>
 #endif
 
 struct Scene {
@@ -48,12 +50,30 @@ struct Scene {
     int max_generic_texture_dimension;
 
 #ifdef COMPILE_WITH_CUDA
-    // Optix handles
-    optix::prime::Context optix_context;
-    std::vector<optix::prime::Model> optix_models;
-    std::vector<RTPmodel> optix_instances;
-    std::vector<Matrix4x4f> transforms;
-    optix::prime::Model optix_scene;
+    // OptiX 9.1 handles
+    OptixDeviceContext optix_context = nullptr;
+    OptixModule optix_module = nullptr;
+    OptixPipeline optix_pipeline = nullptr;
+    OptixProgramGroup raygen_closest_pg = nullptr;
+    OptixProgramGroup raygen_occlusion_pg = nullptr;
+    OptixProgramGroup miss_pg = nullptr;
+    OptixProgramGroup hitgroup_pg = nullptr;
+    OptixShaderBindingTable sbt_closest = {};
+    OptixShaderBindingTable sbt_occlusion = {};
+
+    // Acceleration structures
+    std::vector<OptixTraversableHandle> gas_handles;
+    std::vector<CUdeviceptr> gas_buffers;
+    OptixTraversableHandle ias_handle = 0;
+    CUdeviceptr ias_buffer = 0;
+    CUdeviceptr d_instances_buffer = 0;
+
+    // SBT records and launch params device memory
+    CUdeviceptr d_raygen_closest_record = 0;
+    CUdeviceptr d_raygen_occlusion_record = 0;
+    CUdeviceptr d_miss_record = 0;
+    CUdeviceptr d_hitgroup_record = 0;
+    CUdeviceptr d_launch_params = 0;
 #endif
 
     // Embree handles

@@ -327,7 +327,7 @@ EdgeSampler::EdgeSampler(const std::vector<const Shape*> &shapes,
                 primary_edges_pmf.begin(),
                 primary_edges_pmf.end(),
                 primary_edges_cdf.begin(),
-                thrust::identity<Real>(), Real(0), thrust::plus<Real>());
+                identity_functor<Real>(), Real(0), thrust::plus<Real>());
         }
     }
 
@@ -363,7 +363,7 @@ EdgeSampler::EdgeSampler(const std::vector<const Shape*> &shapes,
                     secondary_edges_pmf.begin(),
                     secondary_edges_pmf.end(),
                     secondary_edges_cdf.begin(),
-                    thrust::identity<Real>(), Real(0), thrust::plus<Real>());
+                    identity_functor<Real>(), Real(0), thrust::plus<Real>());
             }
             // Build a hierarchical data structure for edge sampling
             edge_tree = std::unique_ptr<EdgeTree>(

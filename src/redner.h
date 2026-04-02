@@ -169,6 +169,12 @@ inline int popc(uint8_t x) {
 #endif
 }
 
+// Compatibility: thrust::identity<T> was removed in CCCL.
+template <typename T>
+struct identity_functor {
+    DEVICE T operator()(const T &x) const { return x; }
+};
+
 #define STR(x) #x
 #define ASSERT(x) if (!(x)) { printf("Assertion failed: (%s), function %s, file %s, line %d.\n", STR(x), __PRETTY_FUNCTION__, __FILE__, __LINE__); abort(); }
 

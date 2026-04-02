@@ -14,6 +14,27 @@
 #include <embree3/rtcore_ray.h>
 #include <algorithm>
 
+#ifdef COMPILE_WITH_CUDA
+#include <optix_function_table_definition.h>
+#include "optix_launch_params.h"
+#include "optix_programs_ptx.h"
+
+#define OPTIX_CHECK(call)                                                     \
+    do {                                                                      \
+        OptixResult res = call;                                               \
+        if (res != OPTIX_SUCCESS) {                                           \
+            fprintf(stderr, "OptiX error: %s at %s:%d\n",                     \
+                    optixGetErrorString(res), __FILE__, __LINE__);            \
+            exit(1);                                                          \
+        }                                                                     \
+    } while (0)
+
+// SBT record: just the header, no per-record data needed
+struct __align__(OPTIX_SBT_RECORD_ALIGNMENT) SbtRecord {
+    char header[OPTIX_SBT_RECORD_HEADER_SIZE];
+};
+#endif
+
 struct vector3f_min {
     DEVICE Vector3f operator()(const Vector3f &a, const Vector3f &b) const {
         return Vector3{min(a.x, b.x), min(a.y, b.y), min(a.z, b.z)};
@@ -48,7 +69,7 @@ Real compute_area_cdf(const Shape &shape, Real *cdf, bool use_gpu) {
     //thrust::exclusive_scan(dev_ptr, dev_ptr + shape.num_triangles, dev_ptr);
     DISPATCH(use_gpu, thrust::transform_exclusive_scan,
              cdf, cdf + shape.num_triangles, cdf,
-             thrust::identity<Real>(), Real(0), thrust::plus<Real>());
+             identity_functor<Real>(), Real(0), thrust::plus<Real>());
     // Normalize the CDF by total area
     DISPATCH(use_gpu, thrust::transform,
              cdf, cdf + shape.num_triangles,
@@ -77,50 +98,235 @@ Scene::Scene(const Camera &camera,
 #endif
     if (use_gpu) {
 #ifdef __NVCC__
-        // Initialize the scene in another thread, since optix prime calls cudaSetDeviceFlags
-        // and becomes unhappy if we create a context in the main thread
         checkCuda(cudaGetDevice(&old_device_id));
         if (gpu_index != -1) {
             checkCuda(cudaSetDevice(gpu_index));
         }
-        // Initialize Optix prime scene
-        // FIXME: optix context creation calls cudaDeviceSetFlags(), but we already
-        // activate CUDA before this. Ideally we want to move context creation to an initialization
-        // phase, but we also want to have a context for each GPU.
-        // We should create a context array in global memory and fetch the corresponding context.
-        optix_context = optix::prime::Context::create(RTP_CONTEXT_TYPE_CUDA);
-        if (gpu_index != -1) {
-            optix_context->setCudaDeviceNumbers({(uint32_t)gpu_index});
-        }
-        optix_models.resize(shapes.size());
-        optix_instances.resize(shapes.size());
-        transforms.resize(shapes.size(), Matrix4x4f::identity());
+
+        // --- OptiX 9.1 initialization ---
+        OPTIX_CHECK(optixInit());
+
+        CUcontext cu_ctx = nullptr;
+        cuCtxGetCurrent(&cu_ctx);
+        OptixDeviceContextOptions ctx_options = {};
+        OPTIX_CHECK(optixDeviceContextCreate(cu_ctx, &ctx_options, &optix_context));
+
+        // Load PTX and create module
+        OptixModuleCompileOptions module_compile_options = {};
+        module_compile_options.maxRegisterCount = OPTIX_COMPILE_DEFAULT_MAX_REGISTER_COUNT;
+        module_compile_options.optLevel = OPTIX_COMPILE_OPTIMIZATION_DEFAULT;
+        module_compile_options.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_NONE;
+
+        OptixPipelineCompileOptions pipeline_compile_options = {};
+        pipeline_compile_options.usesMotionBlur = 0;
+        pipeline_compile_options.traversableGraphFlags =
+            OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_LEVEL_INSTANCING;
+        pipeline_compile_options.numPayloadValues = 3;
+        pipeline_compile_options.numAttributeValues = 2;
+        pipeline_compile_options.exceptionFlags = OPTIX_EXCEPTION_FLAG_NONE;
+        pipeline_compile_options.pipelineLaunchParamsVariableName = "params";
+
+        char log[2048];
+        size_t log_size = sizeof(log);
+        OPTIX_CHECK(optixModuleCreate(
+            optix_context,
+            &module_compile_options,
+            &pipeline_compile_options,
+            reinterpret_cast<const char*>(optix_programs_ptx),
+            sizeof(optix_programs_ptx),
+            log, &log_size,
+            &optix_module));
+
+        // Create program groups
+        OptixProgramGroupOptions pg_options = {};
+
+        OptixProgramGroupDesc raygen_closest_desc = {};
+        raygen_closest_desc.kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
+        raygen_closest_desc.raygen.module = optix_module;
+        raygen_closest_desc.raygen.entryFunctionName = "__raygen__closest";
+        log_size = sizeof(log);
+        OPTIX_CHECK(optixProgramGroupCreate(optix_context, &raygen_closest_desc, 1,
+            &pg_options, log, &log_size, &raygen_closest_pg));
+
+        OptixProgramGroupDesc raygen_occlusion_desc = {};
+        raygen_occlusion_desc.kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
+        raygen_occlusion_desc.raygen.module = optix_module;
+        raygen_occlusion_desc.raygen.entryFunctionName = "__raygen__occlusion";
+        log_size = sizeof(log);
+        OPTIX_CHECK(optixProgramGroupCreate(optix_context, &raygen_occlusion_desc, 1,
+            &pg_options, log, &log_size, &raygen_occlusion_pg));
+
+        OptixProgramGroupDesc miss_desc = {};
+        miss_desc.kind = OPTIX_PROGRAM_GROUP_KIND_MISS;
+        miss_desc.miss.module = optix_module;
+        miss_desc.miss.entryFunctionName = "__miss__ms";
+        log_size = sizeof(log);
+        OPTIX_CHECK(optixProgramGroupCreate(optix_context, &miss_desc, 1,
+            &pg_options, log, &log_size, &miss_pg));
+
+        OptixProgramGroupDesc hitgroup_desc = {};
+        hitgroup_desc.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
+        hitgroup_desc.hitgroup.moduleCH = optix_module;
+        hitgroup_desc.hitgroup.entryFunctionNameCH = "__closesthit__ch";
+        log_size = sizeof(log);
+        OPTIX_CHECK(optixProgramGroupCreate(optix_context, &hitgroup_desc, 1,
+            &pg_options, log, &log_size, &hitgroup_pg));
+
+        // Create pipeline
+        OptixProgramGroup all_groups[] = {
+            raygen_closest_pg, raygen_occlusion_pg, miss_pg, hitgroup_pg
+        };
+        OptixPipelineLinkOptions pipeline_link_options = {};
+        pipeline_link_options.maxTraceDepth = 1;
+        log_size = sizeof(log);
+        OPTIX_CHECK(optixPipelineCreate(
+            optix_context,
+            &pipeline_compile_options,
+            &pipeline_link_options,
+            all_groups, 4,
+            log, &log_size,
+            &optix_pipeline));
+
+        // Build SBT records
+        SbtRecord raygen_closest_rec = {};
+        SbtRecord raygen_occlusion_rec = {};
+        SbtRecord miss_rec = {};
+        SbtRecord hitgroup_rec = {};
+        OPTIX_CHECK(optixSbtRecordPackHeader(raygen_closest_pg, &raygen_closest_rec));
+        OPTIX_CHECK(optixSbtRecordPackHeader(raygen_occlusion_pg, &raygen_occlusion_rec));
+        OPTIX_CHECK(optixSbtRecordPackHeader(miss_pg, &miss_rec));
+        OPTIX_CHECK(optixSbtRecordPackHeader(hitgroup_pg, &hitgroup_rec));
+
+        checkCuda(cudaMalloc(reinterpret_cast<void**>(&d_raygen_closest_record), sizeof(SbtRecord)));
+        checkCuda(cudaMemcpy(reinterpret_cast<void*>(d_raygen_closest_record),
+            &raygen_closest_rec, sizeof(SbtRecord), cudaMemcpyHostToDevice));
+
+        checkCuda(cudaMalloc(reinterpret_cast<void**>(&d_raygen_occlusion_record), sizeof(SbtRecord)));
+        checkCuda(cudaMemcpy(reinterpret_cast<void*>(d_raygen_occlusion_record),
+            &raygen_occlusion_rec, sizeof(SbtRecord), cudaMemcpyHostToDevice));
+
+        checkCuda(cudaMalloc(reinterpret_cast<void**>(&d_miss_record), sizeof(SbtRecord)));
+        checkCuda(cudaMemcpy(reinterpret_cast<void*>(d_miss_record),
+            &miss_rec, sizeof(SbtRecord), cudaMemcpyHostToDevice));
+
+        checkCuda(cudaMalloc(reinterpret_cast<void**>(&d_hitgroup_record), sizeof(SbtRecord)));
+        checkCuda(cudaMemcpy(reinterpret_cast<void*>(d_hitgroup_record),
+            &hitgroup_rec, sizeof(SbtRecord), cudaMemcpyHostToDevice));
+
+        // SBT for closest-hit queries
+        sbt_closest.raygenRecord = d_raygen_closest_record;
+        sbt_closest.missRecordBase = d_miss_record;
+        sbt_closest.missRecordStrideInBytes = sizeof(SbtRecord);
+        sbt_closest.missRecordCount = 1;
+        sbt_closest.hitgroupRecordBase = d_hitgroup_record;
+        sbt_closest.hitgroupRecordStrideInBytes = sizeof(SbtRecord);
+        sbt_closest.hitgroupRecordCount = 1;
+
+        // SBT for occlusion queries (only raygen differs)
+        sbt_occlusion = sbt_closest;
+        sbt_occlusion.raygenRecord = d_raygen_occlusion_record;
+
+        // Allocate launch params buffer
+        checkCuda(cudaMalloc(reinterpret_cast<void**>(&d_launch_params), sizeof(LaunchParams)));
+
+        // Build GAS (Geometry Acceleration Structure) per shape
+        gas_handles.resize(shapes.size());
+        gas_buffers.resize(shapes.size(), 0);
+
         for (int shape_id = 0; shape_id < (int)shapes.size(); shape_id++) {
             const Shape *shape = shapes[shape_id];
-            optix_models[shape_id] = optix_context->createModel();
-            optix_models[shape_id]->setTriangles(
-                shape->num_triangles, RTP_BUFFER_TYPE_CUDA_LINEAR, shape->indices,
-                shape->num_vertices, RTP_BUFFER_TYPE_CUDA_LINEAR, shape->vertices);
-            optix_models[shape_id]->update(RTP_MODEL_HINT_ASYNC);
-            optix_instances[shape_id] = optix_models[shape_id]->getRTPmodel();
+
+            OptixBuildInput build_input = {};
+            build_input.type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
+
+            CUdeviceptr vertex_ptr = reinterpret_cast<CUdeviceptr>(shape->vertices);
+            build_input.triangleArray.vertexBuffers = &vertex_ptr;
+            build_input.triangleArray.numVertices = shape->num_vertices;
+            build_input.triangleArray.vertexFormat = OPTIX_VERTEX_FORMAT_FLOAT3;
+            build_input.triangleArray.vertexStrideInBytes = sizeof(float) * 3;
+
+            build_input.triangleArray.indexBuffer = reinterpret_cast<CUdeviceptr>(shape->indices);
+            build_input.triangleArray.numIndexTriplets = shape->num_triangles;
+            build_input.triangleArray.indexFormat = OPTIX_INDICES_FORMAT_UNSIGNED_INT3;
+            build_input.triangleArray.indexStrideInBytes = sizeof(int) * 3;
+
+            unsigned int geom_flags = OPTIX_GEOMETRY_FLAG_DISABLE_ANYHIT;
+            build_input.triangleArray.flags = &geom_flags;
+            build_input.triangleArray.numSbtRecords = 1;
+
+            OptixAccelBuildOptions accel_options = {};
+            accel_options.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
+            accel_options.operation = OPTIX_BUILD_OPERATION_BUILD;
+
+            OptixAccelBufferSizes buffer_sizes;
+            OPTIX_CHECK(optixAccelComputeMemoryUsage(
+                optix_context, &accel_options, &build_input, 1, &buffer_sizes));
+
+            CUdeviceptr temp_buffer;
+            checkCuda(cudaMalloc(reinterpret_cast<void**>(&temp_buffer),
+                buffer_sizes.tempSizeInBytes));
+            checkCuda(cudaMalloc(reinterpret_cast<void**>(&gas_buffers[shape_id]),
+                buffer_sizes.outputSizeInBytes));
+
+            OPTIX_CHECK(optixAccelBuild(
+                optix_context, 0,
+                &accel_options, &build_input, 1,
+                temp_buffer, buffer_sizes.tempSizeInBytes,
+                gas_buffers[shape_id], buffer_sizes.outputSizeInBytes,
+                &gas_handles[shape_id], nullptr, 0));
+
+            checkCuda(cudaFree(reinterpret_cast<void*>(temp_buffer)));
         }
 
-        for (int shape_id = 0; shape_id < (int)shapes.size(); shape_id++) {
-            optix_models[shape_id]->finish();
-        }
-
-        optix_scene = optix_context->createModel();
+        // Build IAS (Instance Acceleration Structure)
         if (shapes.size() > 0) {
-            optix_scene->setInstances(
-                (int)shapes.size(), RTP_BUFFER_TYPE_HOST, &optix_instances[0], 
-                RTP_BUFFER_FORMAT_TRANSFORM_FLOAT4x4, RTP_BUFFER_TYPE_HOST, &transforms[0]);
-        } else {
-            // Hack: the last argument is the pointer to a buffer, but optix prime
-            // complains if we pass nullptr. Therefore we give it a non zero number.
-            optix_scene->setTriangles(0, RTP_BUFFER_TYPE_CUDA_LINEAR, (const void *)1);
+            std::vector<OptixInstance> instances(shapes.size());
+            for (int i = 0; i < (int)shapes.size(); i++) {
+                memset(&instances[i], 0, sizeof(OptixInstance));
+                // Identity transform (3x4 row-major)
+                instances[i].transform[0]  = 1.0f;
+                instances[i].transform[5]  = 1.0f;
+                instances[i].transform[10] = 1.0f;
+                instances[i].instanceId = i;
+                instances[i].sbtOffset = 0;
+                instances[i].visibilityMask = 0xFF;
+                instances[i].flags = OPTIX_INSTANCE_FLAG_NONE;
+                instances[i].traversableHandle = gas_handles[i];
+            }
+
+            size_t instances_size = sizeof(OptixInstance) * shapes.size();
+            checkCuda(cudaMalloc(reinterpret_cast<void**>(&d_instances_buffer), instances_size));
+            checkCuda(cudaMemcpy(reinterpret_cast<void*>(d_instances_buffer),
+                instances.data(), instances_size, cudaMemcpyHostToDevice));
+
+            OptixBuildInput ias_input = {};
+            ias_input.type = OPTIX_BUILD_INPUT_TYPE_INSTANCES;
+            ias_input.instanceArray.instances = d_instances_buffer;
+            ias_input.instanceArray.numInstances = (unsigned int)shapes.size();
+
+            OptixAccelBuildOptions ias_options = {};
+            ias_options.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
+            ias_options.operation = OPTIX_BUILD_OPERATION_BUILD;
+
+            OptixAccelBufferSizes ias_buffer_sizes;
+            OPTIX_CHECK(optixAccelComputeMemoryUsage(
+                optix_context, &ias_options, &ias_input, 1, &ias_buffer_sizes));
+
+            CUdeviceptr ias_temp;
+            checkCuda(cudaMalloc(reinterpret_cast<void**>(&ias_temp),
+                ias_buffer_sizes.tempSizeInBytes));
+            checkCuda(cudaMalloc(reinterpret_cast<void**>(&ias_buffer),
+                ias_buffer_sizes.outputSizeInBytes));
+
+            OPTIX_CHECK(optixAccelBuild(
+                optix_context, 0,
+                &ias_options, &ias_input, 1,
+                ias_temp, ias_buffer_sizes.tempSizeInBytes,
+                ias_buffer, ias_buffer_sizes.outputSizeInBytes,
+                &ias_handle, nullptr, 0));
+
+            checkCuda(cudaFree(reinterpret_cast<void*>(ias_temp)));
         }
-        optix_scene->update(RTP_MODEL_HINT_NONE);
-        optix_scene->finish();
 #else
         assert(false);
 #endif
@@ -319,6 +525,26 @@ Scene::~Scene() {
             checkCuda(cudaSetDevice(gpu_index));
         }
         checkCuda(cudaFree(envmap));
+
+        // Clean up OptiX 9.1 resources
+        if (d_launch_params) cudaFree(reinterpret_cast<void*>(d_launch_params));
+        if (d_raygen_closest_record) cudaFree(reinterpret_cast<void*>(d_raygen_closest_record));
+        if (d_raygen_occlusion_record) cudaFree(reinterpret_cast<void*>(d_raygen_occlusion_record));
+        if (d_miss_record) cudaFree(reinterpret_cast<void*>(d_miss_record));
+        if (d_hitgroup_record) cudaFree(reinterpret_cast<void*>(d_hitgroup_record));
+        if (ias_buffer) cudaFree(reinterpret_cast<void*>(ias_buffer));
+        if (d_instances_buffer) cudaFree(reinterpret_cast<void*>(d_instances_buffer));
+        for (auto buf : gas_buffers) {
+            if (buf) cudaFree(reinterpret_cast<void*>(buf));
+        }
+        if (optix_pipeline) optixPipelineDestroy(optix_pipeline);
+        if (hitgroup_pg) optixProgramGroupDestroy(hitgroup_pg);
+        if (miss_pg) optixProgramGroupDestroy(miss_pg);
+        if (raygen_occlusion_pg) optixProgramGroupDestroy(raygen_occlusion_pg);
+        if (raygen_closest_pg) optixProgramGroupDestroy(raygen_closest_pg);
+        if (optix_module) optixModuleDestroy(optix_module);
+        if (optix_context) optixDeviceContextDestroy(optix_context);
+
         checkCuda(cudaSetDevice(old_device_id));
 #else
         assert(false);
@@ -514,22 +740,29 @@ void intersect(const Scene &scene,
     }
     if (scene.use_gpu) {
 #ifdef __NVCC__
-        // OptiX prime query
-        // Convert the rays to OptiX format
-        to_optix_ray(active_pixels, rays,
-                     optix_rays);
-        optix::prime::Query query =
-            scene.optix_scene->createQuery(RTP_QUERY_TYPE_CLOSEST);
-        query->setRays(active_pixels.size(),
-                       RTP_BUFFER_FORMAT_RAY_ORIGIN_TMIN_DIRECTION_TMAX,
-                       RTP_BUFFER_TYPE_CUDA_LINEAR,
-                       optix_rays.data);
-        query->setHits(active_pixels.size(),
-                       RTP_BUFFER_FORMAT_HIT_T_TRIID_INSTID,
-                       RTP_BUFFER_TYPE_CUDA_LINEAR,
-                       optix_hits.data);
-        // XXX: should use watertight intersection here?
-        query->execute(0);
+        // Convert the rays to OptiX format (existing kernel)
+        to_optix_ray(active_pixels, rays, optix_rays);
+
+        // OptiX 9.1 launch — closest-hit query
+        LaunchParams lp = {};
+        lp.traversable = scene.ias_handle;
+        lp.rays = reinterpret_cast<OptiXRayData*>(optix_rays.data);
+        lp.hits = reinterpret_cast<OptiXHitData*>(optix_hits.data);
+        lp.num_rays = (unsigned int)active_pixels.size();
+
+        checkCuda(cudaMemcpy(reinterpret_cast<void*>(scene.d_launch_params),
+            &lp, sizeof(LaunchParams), cudaMemcpyHostToDevice));
+
+        OPTIX_CHECK(optixLaunch(
+            scene.optix_pipeline,
+            0,  // default stream
+            scene.d_launch_params,
+            sizeof(LaunchParams),
+            &scene.sbt_closest,
+            active_pixels.size(),
+            1, 1));
+
+        // Process results (existing kernel)
         intersect_shape(scene.shapes.data,
                         active_pixels,
                         optix_hits,
@@ -633,21 +866,29 @@ void occluded(const Scene &scene,
               BufferView<OptiXHit> optix_hits) {
     if (scene.use_gpu) {
 #ifdef __NVCC__
-        // OptiX prime query
-        // Convert the rays to OptiX format
+        // Convert the rays to OptiX format (existing kernel)
         to_optix_ray(active_pixels, rays, optix_rays);
-        optix::prime::Query query =
-            scene.optix_scene->createQuery(RTP_QUERY_TYPE_ANY);
-        query->setRays(active_pixels.size(),
-                       RTP_BUFFER_FORMAT_RAY_ORIGIN_TMIN_DIRECTION_TMAX,
-                       RTP_BUFFER_TYPE_CUDA_LINEAR,
-                       optix_rays.data);
-        query->setHits(active_pixels.size(),
-                       RTP_BUFFER_FORMAT_HIT_T_TRIID_INSTID,
-                       RTP_BUFFER_TYPE_CUDA_LINEAR,
-                       optix_hits.data);
-        // XXX: should use watertight intersection here?
-        query->execute(0);
+
+        // OptiX 9.1 launch — occlusion query
+        LaunchParams lp = {};
+        lp.traversable = scene.ias_handle;
+        lp.rays = reinterpret_cast<OptiXRayData*>(optix_rays.data);
+        lp.hits = reinterpret_cast<OptiXHitData*>(optix_hits.data);
+        lp.num_rays = (unsigned int)active_pixels.size();
+
+        checkCuda(cudaMemcpy(reinterpret_cast<void*>(scene.d_launch_params),
+            &lp, sizeof(LaunchParams), cudaMemcpyHostToDevice));
+
+        OPTIX_CHECK(optixLaunch(
+            scene.optix_pipeline,
+            0,  // default stream
+            scene.d_launch_params,
+            sizeof(LaunchParams),
+            &scene.sbt_occlusion,
+            active_pixels.size(),
+            1, 1));
+
+        // Process results (existing kernel)
         update_occluded_rays(active_pixels, optix_hits, rays);
 #else
         assert(false);
